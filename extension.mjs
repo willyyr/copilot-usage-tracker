@@ -116,12 +116,167 @@ function fmtDateTime(iso) {
     });
 }
 
+function fmtPct(n) {
+    return `${n.toFixed(1)}%`;
+}
+
+function fmtUsd(n) {
+    const fractionDigits = n < 1 ? 4 : 2;
+    return new Intl.NumberFormat("en-US", {
+        style: "currency",
+        currency: "USD",
+        minimumFractionDigits: fractionDigits,
+        maximumFractionDigits: fractionDigits,
+    }).format(n);
+}
+
+function padCell(value, width, align = "left") {
+    const text = String(value);
+    return align === "right" ? text.padStart(width) : text.padEnd(width);
+}
+
+function renderTable(headers, rows, aligns = []) {
+    const widths = headers.map((header, index) => {
+        const rowWidth = rows.reduce((max, row) => Math.max(max, String(row[index] ?? "").length), 0);
+        return Math.max(String(header).length, rowWidth);
+    });
+    const headerLine = headers.map((header, index) => padCell(header, widths[index], aligns[index])).join("  ");
+    const separatorLine = widths.map(width => "-".repeat(width)).join("  ");
+    const bodyLines = rows.map(row => row.map((cell, index) => padCell(cell ?? "", widths[index], aligns[index])).join("  "));
+    return [headerLine, separatorLine, ...bodyLines].join("\n");
+}
+
+function renderBarGraph(value, width = 28) {
+    const filled = Math.max(0, Math.min(width, Math.round(value * width)));
+    return `[${"#".repeat(filled)}${"-".repeat(width - filled)}]`;
+}
+
+function buildDateRangeLabel(sessions) {
+    const dates = sessions.map(session => new Date(session.startTime)).sort((a, b) => a - b);
+    return `${fmtDate(dates[0].toISOString())} -> ${fmtDate(dates[dates.length - 1].toISOString())}`;
+}
+
+const PUBLIC_TOKEN_PRICING = [
+    {
+        canonicalModel: "gpt-5.4",
+        aliases: ["gpt-5.4", "gpt-5.4-2026-03-05"],
+        sourceLabel: "OpenAI GPT-5.4 pricing",
+        sourceUrl: "https://developers.openai.com/api/docs/models/gpt-5.4",
+        ratesPerMillion: { input: 2.50, output: 15.00, cacheRead: 0.25 },
+    },
+    {
+        canonicalModel: "gpt-5.4-mini",
+        aliases: ["gpt-5.4-mini", "gpt-5.4-mini-2026-03-17"],
+        sourceLabel: "OpenAI GPT-5.4 mini pricing",
+        sourceUrl: "https://developers.openai.com/api/docs/models/gpt-5.4-mini",
+        ratesPerMillion: { input: 0.75, output: 4.50, cacheRead: 0.075 },
+    },
+    {
+        canonicalModel: "gpt-5.3-codex",
+        aliases: ["gpt-5.3-codex"],
+        sourceLabel: "OpenAI API pricing",
+        sourceUrl: "https://developers.openai.com/api/docs/pricing",
+        ratesPerMillion: { input: 1.75, output: 14.00, cacheRead: 0.175 },
+    },
+    {
+        canonicalModel: "claude-opus-4.6",
+        aliases: ["claude-opus-4.6"],
+        sourceLabel: "Anthropic Claude pricing",
+        sourceUrl: "https://docs.anthropic.com/en/docs/about-claude/pricing",
+        ratesPerMillion: { input: 5.00, output: 25.00, cacheRead: 0.50, cacheWrite: 6.25 },
+    },
+    {
+        canonicalModel: "claude-opus-4.5",
+        aliases: ["claude-opus-4.5"],
+        sourceLabel: "Anthropic Claude pricing",
+        sourceUrl: "https://docs.anthropic.com/en/docs/about-claude/pricing",
+        ratesPerMillion: { input: 5.00, output: 25.00, cacheRead: 0.50, cacheWrite: 6.25 },
+    },
+    {
+        canonicalModel: "claude-sonnet-4.6",
+        aliases: ["claude-sonnet-4.6"],
+        sourceLabel: "Anthropic Claude pricing",
+        sourceUrl: "https://docs.anthropic.com/en/docs/about-claude/pricing",
+        ratesPerMillion: { input: 3.00, output: 15.00, cacheRead: 0.30, cacheWrite: 3.75 },
+    },
+    {
+        canonicalModel: "claude-sonnet-4.5",
+        aliases: ["claude-sonnet-4.5"],
+        sourceLabel: "Anthropic Claude pricing",
+        sourceUrl: "https://docs.anthropic.com/en/docs/about-claude/pricing",
+        ratesPerMillion: { input: 3.00, output: 15.00, cacheRead: 0.30, cacheWrite: 3.75 },
+    },
+    {
+        canonicalModel: "claude-haiku-4.5",
+        aliases: ["claude-haiku-4.5"],
+        sourceLabel: "Anthropic Claude pricing",
+        sourceUrl: "https://docs.anthropic.com/en/docs/about-claude/pricing",
+        ratesPerMillion: { input: 1.00, output: 5.00, cacheRead: 0.10, cacheWrite: 1.25 },
+    },
+];
+
+const PRICING_BY_MODEL = PUBLIC_TOKEN_PRICING.reduce((index, entry) => {
+    for (const alias of entry.aliases) index[alias] = entry;
+    return index;
+}, {});
+
+function lookupPricing(model) {
+    return PRICING_BY_MODEL[model] || null;
+}
+
+function estimateModelRawCost(modelSummary) {
+    const pricing = lookupPricing(modelSummary.model);
+    if (!pricing) {
+        return {
+            available: false,
+            amount: null,
+            coverage: "No exact public source",
+            sourceLabel: "N/A",
+            sourceUrl: null,
+        };
+    }
+
+    const tokenBuckets = [
+        { key: "input", label: "input", tokens: modelSummary.inputTokens },
+        { key: "output", label: "output", tokens: modelSummary.outputTokens },
+        { key: "cacheRead", label: "cache-read", tokens: modelSummary.cacheReadTokens },
+        { key: "cacheWrite", label: "cache-write", tokens: modelSummary.cacheWriteTokens },
+    ];
+    const missingRates = tokenBuckets
+        .filter(bucket => bucket.tokens > 0 && pricing.ratesPerMillion[bucket.key] == null)
+        .map(bucket => bucket.label);
+
+    if (missingRates.length > 0) {
+        return {
+            available: false,
+            amount: null,
+            coverage: `Missing ${missingRates.join(", ")} pricing`,
+            sourceLabel: pricing.sourceLabel,
+            sourceUrl: pricing.sourceUrl,
+        };
+    }
+
+    const amount = tokenBuckets.reduce((sum, bucket) => {
+        const rate = pricing.ratesPerMillion[bucket.key];
+        if (rate == null) return sum;
+        return sum + (bucket.tokens / 1_000_000) * rate;
+    }, 0);
+
+    return {
+        available: true,
+        amount,
+        coverage: "Exact cited pricing",
+        sourceLabel: pricing.sourceLabel,
+        sourceUrl: pricing.sourceUrl,
+    };
+}
+
 // ── Aggregation ──────────────────────────────────────────────────────────────
-function aggregateSessions(sessions, label) {
+function aggregateSessions(sessions, label, dateRange) {
     const byModel = {};
     let totalInput = 0, totalOutput = 0, totalCacheRead = 0, totalCacheWrite = 0;
-    let totalRequests = 0, totalCost = 0, totalDurationMs = 0;
-    let sessionCount = sessions.length;
+    let totalRequests = 0, totalCost = 0;
+    const sessionCount = sessions.length;
 
     for (const sess of sessions) {
         // Prefer shutdown modelMetrics (most accurate) over per-call data
@@ -162,53 +317,107 @@ function aggregateSessions(sessions, label) {
                 totalCacheWrite += c.cacheWriteTokens ?? 0;
                 totalRequests += 1;
                 totalCost += c.cost ?? 0;
-                totalDurationMs += c.duration ?? 0;
             }
         }
     }
 
-    // Build output
+    const models = Object.entries(byModel)
+        .map(([model, metrics]) => ({
+            model,
+            ...metrics,
+            requestShare: totalRequests === 0 ? 0 : metrics.requests / totalRequests,
+            totalTokens: metrics.inputTokens + metrics.outputTokens + metrics.cacheReadTokens + metrics.cacheWriteTokens,
+        }))
+        .sort((a, b) => b.requests - a.requests || b.totalTokens - a.totalTokens);
+
+    const pricingRows = models.map(model => ({
+        ...model,
+        estimate: estimateModelRawCost(model),
+    }));
+    const coveredRequests = pricingRows.reduce((sum, row) => sum + (row.estimate.available ? row.requests : 0), 0);
+    const estimatedRawCost = pricingRows.reduce((sum, row) => sum + (row.estimate.available ? row.estimate.amount : 0), 0);
+    const pricingCoveragePct = totalRequests === 0 ? 0 : (coveredRequests / totalRequests) * 100;
+
     const lines = [];
-    lines.push(`═══ ${label} ═══`);
-    lines.push(`Sessions: ${sessionCount}  |  API calls: ${fmtNum(totalRequests)}  |  Premium requests (cost): ${totalCost.toFixed(1)}`);
-    lines.push(`Total tokens → Input: ${fmtNum(totalInput)}  Output: ${fmtNum(totalOutput)}  Cache-read: ${fmtNum(totalCacheRead)}  Cache-write: ${fmtNum(totalCacheWrite)}`);
+    lines.push(`=== ${label} ===`);
     lines.push("");
 
-    // Sort models by total tokens desc
-    const sorted = Object.entries(byModel).sort((a, b) => {
-        const aTotal = a[1].inputTokens + a[1].outputTokens;
-        const bTotal = b[1].inputTokens + b[1].outputTokens;
-        return bTotal - aTotal;
-    });
+    const metricsRows = [
+        ["Sessions", fmtNum(sessionCount)],
+        ["API calls", fmtNum(totalRequests)],
+        ["Premium requests (cost)", totalCost.toFixed(1)],
+        ["Input tokens", fmtNum(totalInput)],
+        ["Output tokens", fmtNum(totalOutput)],
+        ["Cache-read tokens", fmtNum(totalCacheRead)],
+        ["Cache-write tokens", fmtNum(totalCacheWrite)],
+        ["Raw token cost estimate", fmtUsd(estimatedRawCost)],
+        ["Pricing coverage", `${fmtPct(pricingCoveragePct)} of requests (${fmtNum(coveredRequests)} / ${fmtNum(totalRequests)})`],
+        ["Date range", dateRange],
+    ];
+    lines.push("Metrics");
+    lines.push(renderTable(["Metric", "Value"], metricsRows));
 
-    if (sorted.length === 0) {
+    if (models.length === 0) {
+        lines.push("");
         lines.push("No model usage recorded yet.");
         return lines.join("\n");
     }
 
-    // Table header
-    const hdr = [
-        "Model".padEnd(30),
-        "Calls".padStart(7),
-        "Cost".padStart(8),
-        "Input Tok".padStart(14),
-        "Output Tok".padStart(14),
-        "Cache Read".padStart(14),
-        "Cache Write".padStart(14),
-    ];
-    lines.push(hdr.join("  "));
-    lines.push("─".repeat(hdr.join("  ").length));
+    lines.push("");
+    lines.push("By model");
+    lines.push(renderTable(
+        ["Model", "Requests", "Share", "Premium Cost", "Input", "Output", "Cache Read", "Cache Write"],
+        models.map(model => [
+            model.model,
+            fmtNum(model.requests),
+            fmtPct(model.requestShare * 100),
+            model.cost.toFixed(1),
+            fmtNum(model.inputTokens),
+            fmtNum(model.outputTokens),
+            fmtNum(model.cacheReadTokens),
+            fmtNum(model.cacheWriteTokens),
+        ]),
+        ["left", "right", "right", "right", "right", "right", "right", "right"],
+    ));
 
-    for (const [model, m] of sorted) {
-        lines.push([
-            model.padEnd(30),
-            fmtNum(m.requests).padStart(7),
-            m.cost.toFixed(1).padStart(8),
-            fmtNum(m.inputTokens).padStart(14),
-            fmtNum(m.outputTokens).padStart(14),
-            fmtNum(m.cacheReadTokens).padStart(14),
-            fmtNum(m.cacheWriteTokens).padStart(14),
-        ].join("  "));
+    lines.push("");
+    lines.push("Request share by model");
+    const graphNameWidth = Math.max(...models.map(model => model.model.length), "Model".length);
+    for (const model of models) {
+        lines.push(
+            `${model.model.padEnd(graphNameWidth)}  ${renderBarGraph(model.requestShare)}  ${fmtPct(model.requestShare * 100).padStart(6)} (${fmtNum(model.requests)})`,
+        );
+    }
+
+    lines.push("");
+    lines.push("Raw token pricing estimate");
+    lines.push(`Estimated total (cited models only): ${fmtUsd(estimatedRawCost)}`);
+    lines.push(`Coverage: ${fmtPct(pricingCoveragePct)} of requests (${fmtNum(coveredRequests)} / ${fmtNum(totalRequests)})`);
+    lines.push(renderTable(
+        ["Model", "Raw Est.", "Coverage", "Source"],
+        pricingRows.map(row => [
+            row.model,
+            row.estimate.available ? fmtUsd(row.estimate.amount) : "N/A",
+            row.estimate.coverage,
+            row.estimate.sourceLabel,
+        ]),
+    ));
+
+    const citedSources = pricingRows.reduce((sources, row) => {
+        if (row.estimate.sourceUrl && !sources.some(source => source.url === row.estimate.sourceUrl)) {
+            sources.push({ label: row.estimate.sourceLabel, url: row.estimate.sourceUrl });
+        }
+        return sources;
+    }, []);
+
+    if (citedSources.length > 0) {
+        lines.push("");
+        lines.push("Sources");
+        for (const [index, source] of citedSources.entries()) {
+            lines.push(`[${index + 1}] ${source.label} - ${source.url}`);
+        }
+        lines.push("Method: raw estimate = token counts x official USD-per-1M-token rates. Models without an exact public source stay excluded from the estimate.");
+        lines.push("Note: OpenAI sources list cached-input pricing but not a separate cache-write rate, so any nonzero cache-write tokens on those models are marked N/A.");
     }
 
     return lines.join("\n");
@@ -340,13 +549,7 @@ const session = await joinSession({
                     return `No usage data found for range: ${range}. Usage tracking starts from the first session after this extension was installed.`;
                 }
 
-                let report = aggregateSessions(filtered, labels[range]);
-
-                // Show date range
-                const dates = filtered.map(s => new Date(s.startTime)).sort((a, b) => a - b);
-                report += `\n\nDate range: ${fmtDate(dates[0].toISOString())} → ${fmtDate(dates[dates.length - 1].toISOString())}`;
-
-                return report;
+                return aggregateSessions(filtered, labels[range], buildDateRangeLabel(filtered));
             },
         },
         {
