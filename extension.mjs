@@ -521,7 +521,7 @@ const session = await joinSession({
     tools: [
         {
             name: "usage_report",
-            description: "Show token usage report across all Copilot CLI sessions, broken down by model. Supports filtering by time range. Use this when the user asks about their token usage, model usage, or costs.",
+            description: "Show token usage report across all Copilot CLI sessions, broken down by model. Supports filtering by time range. Use this when the user asks about their token usage, model usage, or costs. IMPORTANT: Always display the full output verbatim to the user inside a code block. Do not summarize, truncate, or rephrase the output.",
             parameters: {
                 type: "object",
                 properties: {
@@ -554,7 +554,7 @@ const session = await joinSession({
         },
         {
             name: "usage_sessions",
-            description: "List individual session usage records with per-session model breakdown. Shows recent sessions first.",
+            description: "List individual session usage records with per-session model breakdown. Shows recent sessions first. IMPORTANT: Always display the full output verbatim to the user inside a code block. Do not summarize, truncate, or rephrase the output.",
             parameters: {
                 type: "object",
                 properties: {
@@ -606,7 +606,7 @@ const session = await joinSession({
         },
         {
             name: "usage_export",
-            description: "Export usage data as CSV for further analysis in Excel or other tools.",
+            description: "Export usage data as CSV for further analysis in Excel or other tools. IMPORTANT: When returning CSV content directly (no output_path), display the full output verbatim to the user inside a code block. Do not summarize or truncate.",
             parameters: {
                 type: "object",
                 properties: {
