@@ -3,6 +3,7 @@
 // Data persists in ~/.copilot/usage-tracker/usage.json
 
 import { joinSession } from "@github/copilot-sdk/extension";
+import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
@@ -32,20 +33,18 @@ function saveData(data) {
 
 // ── In-memory tracking for current session ───────────────────────────────────
 const currentSession = {
+    trackerRecordId: randomUUID(),
     id: null,
     startTime: new Date().toISOString(),
     cwd: process.cwd(),
     calls: [],           // per-API-call records from assistant.usage
-    modelMetrics: null,   // populated from session.shutdown
-    persisted: false,     // guard against double-write
+    shutdownData: null,   // populated from session.shutdown
+    persistedState: "none", // "none" | "partial" | "final"
 };
 
-// Persist session data to disk (idempotent via persisted flag)
-function persistSession(shutdownData) {
-    if (currentSession.persisted) return;
-    currentSession.persisted = true;
-
+function buildSessionRecord(shutdownData = currentSession.shutdownData) {
     const record = {
+        trackerRecordId: currentSession.trackerRecordId,
         id: currentSession.id,
         startTime: currentSession.startTime,
         endTime: new Date().toISOString(),
@@ -63,10 +62,31 @@ function persistSession(shutdownData) {
         record.codeChanges = shutdownData.codeChanges;
     }
 
+    return record;
+}
+
+// Persist session data to disk. Partial records are upgraded in place when
+// authoritative shutdown metrics arrive later in the lifecycle.
+function persistSession(shutdownData = currentSession.shutdownData) {
+    const nextState = shutdownData ? "final" : "partial";
+    if (currentSession.persistedState === "final") return;
+    if (currentSession.persistedState === nextState) return;
+
+    const record = buildSessionRecord(shutdownData);
+
     try {
         const data = loadData();
-        data.sessions.push(record);
+        const existingIndex = data.sessions.findIndex((sess) => sess.trackerRecordId === currentSession.trackerRecordId);
+
+        if (existingIndex >= 0) {
+            data.sessions[existingIndex] = record;
+        } else {
+            data.sessions.push(record);
+        }
+
         saveData(data);
+        currentSession.shutdownData = shutdownData ?? currentSession.shutdownData;
+        currentSession.persistedState = nextState;
     } catch {
         // Silently fail — don't break shutdown
     }
@@ -74,7 +94,7 @@ function persistSession(shutdownData) {
 
 // ── SIGTERM handler: last-resort flush ───────────────────────────────────────
 process.on("SIGTERM", () => {
-    persistSession(null);
+    persistSession();
     process.exit(0);
 });
 
@@ -261,11 +281,11 @@ function handleEvent(event) {
                 initiator: event.data.initiator,
             });
         } else if (event.type === "session.shutdown") {
-            currentSession.modelMetrics = event.data.modelMetrics;
-            persistSession({
+            currentSession.shutdownData = {
                 timestamp: event.timestamp,
                 ...event.data,
-            });
+            };
+            persistSession(currentSession.shutdownData);
         }
     } catch {
         // Never let event handling crash the extension
@@ -275,12 +295,18 @@ function handleEvent(event) {
 // ── Session setup ────────────────────────────────────────────────────────────
 // Use onEvent to capture events fired during joinSession() (e.g. session.start).
 // Use hooks.onSessionEnd as the guaranteed persistence path — the CLI waits for
-// the hook's RPC response before completing shutdown, so the write always finishes.
+// the hook's RPC response before completing shutdown, so we write at least a
+// partial record there and upgrade it if session.shutdown arrives later.
 const session = await joinSession({
     onEvent: handleEvent,
     hooks: {
+        onSessionStart: async (input) => {
+            currentSession.id = input?.sessionId ?? currentSession.id;
+            currentSession.startTime = input?.startTime ?? currentSession.startTime;
+            currentSession.cwd = input?.cwd ?? currentSession.cwd;
+        },
         onSessionEnd: async (_input, _invocation) => {
-            persistSession(null);
+            persistSession();
         },
     },
     tools: [
@@ -471,11 +497,11 @@ const session = await joinSession({
 // that arrive after session creation but are missed by onEvent for any reason)
 session.on("session.shutdown", (event) => {
     try {
-        currentSession.modelMetrics = event.data?.modelMetrics;
-        persistSession({
+        currentSession.shutdownData = {
             timestamp: event.timestamp,
             ...(event.data || {}),
-        });
+        };
+        persistSession(currentSession.shutdownData);
     } catch {
         // Never crash on shutdown
     }
