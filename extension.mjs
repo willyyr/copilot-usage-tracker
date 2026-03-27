@@ -37,7 +37,46 @@ const currentSession = {
     cwd: process.cwd(),
     calls: [],           // per-API-call records from assistant.usage
     modelMetrics: null,   // populated from session.shutdown
+    persisted: false,     // guard against double-write
 };
+
+// Persist session data to disk (idempotent via persisted flag)
+function persistSession(shutdownData) {
+    if (currentSession.persisted) return;
+    currentSession.persisted = true;
+
+    const record = {
+        id: currentSession.id,
+        startTime: currentSession.startTime,
+        endTime: new Date().toISOString(),
+        cwd: currentSession.cwd,
+        calls: currentSession.calls,
+    };
+
+    // Merge shutdown metrics if available (authoritative per-model breakdown)
+    if (shutdownData) {
+        record.endTime = shutdownData.timestamp || record.endTime;
+        record.totalPremiumRequests = shutdownData.totalPremiumRequests;
+        record.totalApiDurationMs = shutdownData.totalApiDurationMs;
+        record.modelMetrics = shutdownData.modelMetrics;
+        record.shutdownType = shutdownData.shutdownType;
+        record.codeChanges = shutdownData.codeChanges;
+    }
+
+    try {
+        const data = loadData();
+        data.sessions.push(record);
+        saveData(data);
+    } catch {
+        // Silently fail — don't break shutdown
+    }
+}
+
+// ── SIGTERM handler: last-resort flush ───────────────────────────────────────
+process.on("SIGTERM", () => {
+    persistSession(null);
+    process.exit(0);
+});
 
 // ── Formatting helpers ───────────────────────────────────────────────────────
 function fmtNum(n) {
@@ -66,7 +105,7 @@ function aggregateSessions(sessions, label) {
 
     for (const sess of sessions) {
         // Prefer shutdown modelMetrics (most accurate) over per-call data
-        if (sess.modelMetrics) {
+        if (sess.modelMetrics && Object.keys(sess.modelMetrics).length > 0) {
             for (const [model, m] of Object.entries(sess.modelMetrics)) {
                 if (!byModel[model]) {
                     byModel[model] = { requests: 0, cost: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
@@ -203,8 +242,47 @@ function filterByRange(sessions, range) {
     });
 }
 
+// ── Event handler: captures ALL events including early ones like session.start ─
+function handleEvent(event) {
+    try {
+        if (event.type === "session.start") {
+            currentSession.id = event.data.sessionId;
+            currentSession.startTime = event.data.startTime || event.timestamp;
+        } else if (event.type === "assistant.usage") {
+            currentSession.calls.push({
+                timestamp: event.timestamp,
+                model: event.data.model,
+                inputTokens: event.data.inputTokens ?? 0,
+                outputTokens: event.data.outputTokens ?? 0,
+                cacheReadTokens: event.data.cacheReadTokens ?? 0,
+                cacheWriteTokens: event.data.cacheWriteTokens ?? 0,
+                cost: event.data.cost ?? 0,
+                duration: event.data.duration ?? 0,
+                initiator: event.data.initiator,
+            });
+        } else if (event.type === "session.shutdown") {
+            currentSession.modelMetrics = event.data.modelMetrics;
+            persistSession({
+                timestamp: event.timestamp,
+                ...event.data,
+            });
+        }
+    } catch {
+        // Never let event handling crash the extension
+    }
+}
+
 // ── Session setup ────────────────────────────────────────────────────────────
+// Use onEvent to capture events fired during joinSession() (e.g. session.start).
+// Use hooks.onSessionEnd as the guaranteed persistence path — the CLI waits for
+// the hook's RPC response before completing shutdown, so the write always finishes.
 const session = await joinSession({
+    onEvent: handleEvent,
+    hooks: {
+        onSessionEnd: async (_input, _invocation) => {
+            persistSession(null);
+        },
+    },
     tools: [
         {
             name: "usage_report",
@@ -326,7 +404,7 @@ const session = await joinSession({
                     const date = sess.startTime?.split("T")[0] || "unknown";
                     const sid = sess.id || "unknown";
 
-                    if (sess.modelMetrics) {
+                    if (sess.modelMetrics && Object.keys(sess.modelMetrics).length > 0) {
                         for (const [model, m] of Object.entries(sess.modelMetrics)) {
                             rows.push([
                                 date, sid, model,
@@ -389,55 +467,17 @@ const session = await joinSession({
     ],
 });
 
-// ── Event listeners ──────────────────────────────────────────────────────────
-
-// Track per-API-call usage (granular, real-time)
-session.on("assistant.usage", (event) => {
-    currentSession.calls.push({
-        timestamp: event.timestamp,
-        model: event.data.model,
-        inputTokens: event.data.inputTokens ?? 0,
-        outputTokens: event.data.outputTokens ?? 0,
-        cacheReadTokens: event.data.cacheReadTokens ?? 0,
-        cacheWriteTokens: event.data.cacheWriteTokens ?? 0,
-        cost: event.data.cost ?? 0,
-        duration: event.data.duration ?? 0,
-        initiator: event.data.initiator,
-    });
-});
-
-// Capture session start info
-session.on("session.start", (event) => {
-    currentSession.id = event.data.sessionId;
-    currentSession.startTime = event.timestamp;
-});
-
-// On shutdown, persist session data with the authoritative modelMetrics
+// Also register event handler post-joinSession as backup (catches events
+// that arrive after session creation but are missed by onEvent for any reason)
 session.on("session.shutdown", (event) => {
-    const d = event.data;
-    currentSession.modelMetrics = d.modelMetrics;
-
-    const record = {
-        id: currentSession.id,
-        startTime: currentSession.startTime,
-        endTime: event.timestamp,
-        cwd: currentSession.cwd,
-        totalPremiumRequests: d.totalPremiumRequests,
-        totalApiDurationMs: d.totalApiDurationMs,
-        modelMetrics: d.modelMetrics,
-        currentModel: d.currentModel,
-        shutdownType: d.shutdownType,
-        codeChanges: d.codeChanges,
-        // Keep per-call data as backup (useful if modelMetrics is empty for some reason)
-        calls: currentSession.calls,
-    };
-
     try {
-        const data = loadData();
-        data.sessions.push(record);
-        saveData(data);
-    } catch (e) {
-        // Silently fail - don't break the session shutdown
+        currentSession.modelMetrics = event.data?.modelMetrics;
+        persistSession({
+            timestamp: event.timestamp,
+            ...(event.data || {}),
+        });
+    } catch {
+        // Never crash on shutdown
     }
 });
 
