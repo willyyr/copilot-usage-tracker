@@ -696,8 +696,36 @@ const session = await joinSession({
     ],
 });
 
-// Also register event handler post-joinSession as backup (catches events
-// that arrive after session creation but are missed by onEvent for any reason)
+// Register event handlers post-joinSession.  The onEvent callback passed to
+// joinSession() only fires for events replayed during initialization.  We must
+// use session.on() to capture events that arrive during the rest of the session.
+
+session.on("assistant.usage", (event) => {
+    try {
+        const d = event.data || {};
+        // Deduplicate: onEvent may have already captured the same event during init
+        const isDuplicate = currentSession.calls.some(
+            c => c.timestamp === event.timestamp && c.model === d.model
+                && c.inputTokens === (d.inputTokens ?? 0)
+        );
+        if (!isDuplicate) {
+            currentSession.calls.push({
+                timestamp: event.timestamp,
+                model: d.model,
+                inputTokens: d.inputTokens ?? 0,
+                outputTokens: d.outputTokens ?? 0,
+                cacheReadTokens: d.cacheReadTokens ?? 0,
+                cacheWriteTokens: d.cacheWriteTokens ?? 0,
+                cost: d.cost ?? 0,
+                duration: d.duration ?? 0,
+                initiator: d.initiator,
+            });
+        }
+    } catch {
+        // Never crash on usage event
+    }
+});
+
 session.on("session.shutdown", (event) => {
     try {
         currentSession.shutdownData = {
