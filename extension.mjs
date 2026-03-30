@@ -608,13 +608,14 @@ function formatQuotaSection(quota) {
     if (quota.unlimited) {
         const kvRows = [
             ["Plan", `${planLabel} (unlimited)`],
-            ["Premium used", `${fmtNum(quota.used)} / ${fmtNum(quota.quota)} included`],
-            ["Remaining", fmtNum(quota.remaining)],
+            ["Included", `${fmtNum(quota.quota)} premium requests (no cap — overage allowed)`],
         ];
         if (quota.resetAt) {
             try { kvRows.push(["Resets", fmtDate(quota.resetAt)]); }
             catch { kvRows.push(["Resets", quota.resetAt]); }
         }
+        kvRows.push(["Note", "API does not track real-time usage for unlimited plans"]);
+        kvRows.push(["", "See https://github.com/settings/copilot for actual usage"]);
         const keyWidth = Math.max(...kvRows.map(([k]) => k.length));
         lines.push(kvRows.map(([k, v]) => `  ${k.padEnd(keyWidth)}  ${v}`).join("\n"));
     } else {
