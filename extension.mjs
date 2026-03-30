@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { execFileSync } from "node:child_process";
 
 // ── Storage ──────────────────────────────────────────────────────────────────
 const DATA_DIR = join(homedir(), ".copilot", "usage-tracker");
@@ -471,6 +472,177 @@ function filterByRange(sessions, range) {
     });
 }
 
+// ── GitHub Copilot Quota API (undocumented, best-effort) ─────────────────────
+function getGitHubTokenWithSource() {
+    // Prefer `gh auth token` scoped to github.com — this returns the interactive
+    // user's token and avoids leaking GHES tokens to api.github.com.
+    try {
+        const token = execFileSync("gh", ["auth", "token", "--hostname", "github.com"], {
+            encoding: "utf-8",
+            timeout: 5000,
+            stdio: ["pipe", "pipe", "pipe"],
+        }).trim();
+        if (token) return { token, source: "gh-cli" };
+    } catch {
+        // gh CLI not available or not authenticated for github.com
+    }
+
+    // Fallback to env vars — these may belong to a bot/automation account, so
+    // the quota shown could differ from the interactive CLI user's quota.
+    const envToken = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+    if (envToken) return { token: envToken, source: "env" };
+
+    return null;
+}
+
+async function fetchCopilotQuota() {
+    if (typeof globalThis.fetch !== "function") return null;
+    const resolved = getGitHubTokenWithSource();
+    if (!resolved) return null;
+    const { token, source: tokenSource } = resolved;
+
+    // Try /copilot_internal/user first — works for all plan types and returns
+    // richer data (plan name, overage info, percent_remaining).
+    try {
+        const resp = await fetch("https://api.github.com/copilot_internal/user", {
+            headers: {
+                Authorization: `token ${token}`,
+                Accept: "application/json",
+                "X-GitHub-Api-Version": "2025-05-01",
+                "User-Agent": "copilot-cli-usage-tracker/1.0",
+            },
+            signal: AbortSignal.timeout?.(8000),
+        });
+        if (resp.ok) {
+            const data = await resp.json();
+            const pi = data?.quota_snapshots?.premium_interactions;
+            if (pi && pi.entitlement !== undefined) {
+                const entitlement = pi.entitlement;
+                const remaining = pi.remaining ?? Math.round(entitlement * (pi.percent_remaining ?? 100) / 100);
+                const used = entitlement - remaining;
+                return {
+                    used,
+                    remaining,
+                    quota: entitlement,
+                    resetAt: data.quota_reset_date_utc ?? data.quota_reset_date ?? "",
+                    unlimited: pi.unlimited ?? false,
+                    overagePermitted: pi.overage_permitted ?? false,
+                    overageCount: pi.overage_count ?? 0,
+                    plan: data.copilot_plan ?? "unknown",
+                    tokenSource,
+                };
+            }
+        }
+    } catch {
+        // Endpoint not available or timed out
+    }
+
+    // Fallback: /copilot_internal/v2/token — may return the same
+    // quota_snapshots shape or the older limited_user_quotas shape.
+    try {
+        const resp = await fetch("https://api.github.com/copilot_internal/v2/token", {
+            headers: {
+                Authorization: `token ${token}`,
+                Accept: "application/json",
+                "Editor-Version": "copilot-cli/1.0",
+                "Editor-Plugin-Version": "usage-tracker/1.0",
+            },
+            signal: AbortSignal.timeout?.(8000),
+        });
+        if (resp.ok) {
+            const data = await resp.json();
+
+            // Try quota_snapshots first (same shape as /copilot_internal/user)
+            const pi = data?.quota_snapshots?.premium_interactions;
+            if (pi && pi.entitlement !== undefined) {
+                const entitlement = pi.entitlement;
+                const remaining = pi.remaining ?? Math.round(entitlement * (pi.percent_remaining ?? 100) / 100);
+                const used = entitlement - remaining;
+                return {
+                    used,
+                    remaining,
+                    quota: entitlement,
+                    resetAt: data.quota_reset_date_utc ?? data.quota_reset_date ?? "",
+                    unlimited: pi.unlimited ?? false,
+                    overagePermitted: pi.overage_permitted ?? false,
+                    overageCount: pi.overage_count ?? 0,
+                    plan: data.copilot_plan ?? "individual",
+                    tokenSource,
+                };
+            }
+
+            // Older shape: limited_user_quotas.copilot_premium_interaction.storage
+            const cpi = data?.limited_user_quotas?.copilot_premium_interaction;
+            const storage = cpi?.storage;
+            if (storage && storage.quota !== undefined) {
+                return {
+                    used: storage.used ?? 0,
+                    remaining: storage.remaining ?? 0,
+                    quota: storage.quota,
+                    resetAt: cpi?.quota_reset_at ?? "",
+                    unlimited: false,
+                    overagePermitted: false,
+                    overageCount: 0,
+                    plan: "individual",
+                    tokenSource,
+                };
+            }
+        }
+    } catch {
+        // Endpoint not available or timed out
+    }
+
+    return null;
+}
+
+function formatQuotaSection(quota) {
+    const PLAN_LABELS = {
+        free: "Free", individual: "Pro", individual_pro: "Pro+",
+        business: "Business", enterprise: "Enterprise",
+    };
+    const planLabel = PLAN_LABELS[quota.plan] ?? quota.plan;
+    const lines = [];
+
+    lines.push("GitHub Copilot Premium Request Quota (live)");
+
+    if (quota.unlimited) {
+        const kvRows = [
+            ["Plan", `${planLabel} (unlimited)`],
+            ["Premium used", `${fmtNum(quota.used)} / ${fmtNum(quota.quota)} included`],
+            ["Remaining", fmtNum(quota.remaining)],
+        ];
+        if (quota.resetAt) {
+            try { kvRows.push(["Resets", fmtDate(quota.resetAt)]); }
+            catch { kvRows.push(["Resets", quota.resetAt]); }
+        }
+        const keyWidth = Math.max(...kvRows.map(([k]) => k.length));
+        lines.push(kvRows.map(([k, v]) => `  ${k.padEnd(keyWidth)}  ${v}`).join("\n"));
+    } else {
+        const pctUsed = quota.quota > 0 ? quota.used / quota.quota : 0;
+        const kvRows = [
+            ["Plan", planLabel],
+            ["Premium used", `${fmtNum(quota.used)} / ${fmtNum(quota.quota)}`],
+            ["Remaining", fmtNum(quota.remaining)],
+            ["Usage", `${fmtPct(pctUsed * 100)}  ${renderBarGraph(pctUsed)}`],
+        ];
+        if (quota.overagePermitted) {
+            kvRows.push(["Overage", `enabled (${fmtNum(quota.overageCount)} overage requests)`]);
+        }
+        if (quota.resetAt) {
+            try { kvRows.push(["Resets", fmtDate(quota.resetAt)]); }
+            catch { kvRows.push(["Resets", quota.resetAt]); }
+        }
+        const keyWidth = Math.max(...kvRows.map(([k]) => k.length));
+        lines.push(kvRows.map(([k, v]) => `  ${k.padEnd(keyWidth)}  ${v}`).join("\n"));
+    }
+
+    lines.push("  Source: api.github.com/copilot_internal (undocumented — may change)");
+    if (quota.tokenSource === "env") {
+        lines.push("  ⚠ Using GITHUB_TOKEN/GH_TOKEN env var — quota may not match your CLI user");
+    }
+    return lines.join("\n");
+}
+
 // ── Event handler: captures ALL events including early ones like session.start ─
 function handleEvent(event) {
     try {
@@ -545,11 +717,24 @@ const session = await joinSession({
                     all: "All-Time Usage",
                 };
 
+                // Start quota fetch in parallel with local data formatting
+                const quotaPromise = fetchCopilotQuota().catch(() => null);
+
+                const parts = [];
+
                 if (filtered.length === 0) {
-                    return `No usage data found for range: ${range}. Usage tracking starts from the first session after this extension was installed.`;
+                    parts.push(`No usage data found for range: ${range}. Usage tracking starts from the first session after this extension was installed.`);
+                } else {
+                    parts.push(aggregateSessions(filtered, labels[range], buildDateRangeLabel(filtered)));
                 }
 
-                return aggregateSessions(filtered, labels[range], buildDateRangeLabel(filtered));
+                const quota = await quotaPromise;
+                if (quota) {
+                    parts.push("");
+                    parts.push(formatQuotaSection(quota));
+                }
+
+                return parts.join("\n");
             },
         },
         {
