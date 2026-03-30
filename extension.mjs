@@ -43,6 +43,10 @@ const currentSession = {
     persistedState: "none", // "none" | "partial" | "final"
 };
 
+// Promise-based gate so onSessionEnd can wait for session.shutdown to arrive.
+let _resolveShutdownGate = null;
+const _shutdownGate = new Promise((resolve) => { _resolveShutdownGate = resolve; });
+
 function buildSessionRecord(shutdownData = currentSession.shutdownData) {
     const record = {
         trackerRecordId: currentSession.trackerRecordId,
@@ -70,8 +74,10 @@ function buildSessionRecord(shutdownData = currentSession.shutdownData) {
 // authoritative shutdown metrics arrive later in the lifecycle.
 function persistSession(shutdownData = currentSession.shutdownData) {
     const nextState = shutdownData ? "final" : "partial";
-    if (currentSession.persistedState === "final") return;
-    if (currentSession.persistedState === nextState) return;
+    // Never downgrade final → partial; allow final → final so a later
+    // shutdown event can overwrite stale data (e.g. from --resume replay).
+    if (currentSession.persistedState === "final" && nextState === "partial") return;
+    if (currentSession.persistedState === nextState && nextState === "partial") return;
 
     const record = buildSessionRecord(shutdownData);
 
@@ -644,30 +650,15 @@ function formatQuotaSection(quota) {
     return lines.join("\n");
 }
 
-// ── Event handler: captures ALL events including early ones like session.start ─
+// ── Event handler: captures session.start during init (the only event that ──
+// ── may fire before session.on() listeners are registered).                ──
+// ── assistant.usage and session.shutdown are handled exclusively via        ──
+// ── session.on() to avoid double-capture and stale-replay issues.          ──
 function handleEvent(event) {
     try {
         if (event.type === "session.start") {
             currentSession.id = event.data.sessionId;
             currentSession.startTime = event.data.startTime || event.timestamp;
-        } else if (event.type === "assistant.usage") {
-            currentSession.calls.push({
-                timestamp: event.timestamp,
-                model: event.data.model,
-                inputTokens: event.data.inputTokens ?? 0,
-                outputTokens: event.data.outputTokens ?? 0,
-                cacheReadTokens: event.data.cacheReadTokens ?? 0,
-                cacheWriteTokens: event.data.cacheWriteTokens ?? 0,
-                cost: event.data.cost ?? 0,
-                duration: event.data.duration ?? 0,
-                initiator: event.data.initiator,
-            });
-        } else if (event.type === "session.shutdown") {
-            currentSession.shutdownData = {
-                timestamp: event.timestamp,
-                ...event.data,
-            };
-            persistSession(currentSession.shutdownData);
         }
     } catch {
         // Never let event handling crash the extension
@@ -687,7 +678,29 @@ const session = await joinSession({
             currentSession.startTime = input?.startTime ?? currentSession.startTime;
             currentSession.cwd = input?.cwd ?? currentSession.cwd;
         },
-        onSessionEnd: async (_input, _invocation) => {
+        onSessionEnd: async (input, _invocation) => {
+            // The input may carry the same authoritative metrics as session.shutdown.
+            if (input && !currentSession.shutdownData) {
+                const candidate = {
+                    timestamp: input.timestamp || new Date().toISOString(),
+                    ...(typeof input === "object" ? input : {}),
+                };
+                if (candidate.modelMetrics || candidate.totalPremiumRequests != null) {
+                    currentSession.shutdownData = candidate;
+                }
+            }
+
+            // session.shutdown is an async event that may arrive just after (or
+            // just before) this hook fires.  Give it a brief window to land so
+            // we can persist the authoritative modelMetrics instead of a partial
+            // calls-only record.
+            if (!currentSession.shutdownData) {
+                await Promise.race([
+                    _shutdownGate,
+                    new Promise((r) => setTimeout(r, 500)),
+                ]);
+            }
+
             persistSession();
         },
     },
@@ -882,31 +895,24 @@ const session = await joinSession({
     ],
 });
 
-// Register event handlers post-joinSession.  The onEvent callback passed to
-// joinSession() only fires for events replayed during initialization.  We must
-// use session.on() to capture events that arrive during the rest of the session.
+// Register event handlers post-joinSession.  handleEvent (onEvent) only
+// handles session.start; all other events are captured exclusively here
+// to avoid the double-fire duplication that occurred when both paths ran.
 
 session.on("assistant.usage", (event) => {
     try {
         const d = event.data || {};
-        // Deduplicate: onEvent may have already captured the same event during init
-        const isDuplicate = currentSession.calls.some(
-            c => c.timestamp === event.timestamp && c.model === d.model
-                && c.inputTokens === (d.inputTokens ?? 0)
-        );
-        if (!isDuplicate) {
-            currentSession.calls.push({
-                timestamp: event.timestamp,
-                model: d.model,
-                inputTokens: d.inputTokens ?? 0,
-                outputTokens: d.outputTokens ?? 0,
-                cacheReadTokens: d.cacheReadTokens ?? 0,
-                cacheWriteTokens: d.cacheWriteTokens ?? 0,
-                cost: d.cost ?? 0,
-                duration: d.duration ?? 0,
-                initiator: d.initiator,
-            });
-        }
+        currentSession.calls.push({
+            timestamp: event.timestamp,
+            model: d.model,
+            inputTokens: d.inputTokens ?? 0,
+            outputTokens: d.outputTokens ?? 0,
+            cacheReadTokens: d.cacheReadTokens ?? 0,
+            cacheWriteTokens: d.cacheWriteTokens ?? 0,
+            cost: d.cost ?? 0,
+            duration: d.duration ?? 0,
+            initiator: d.initiator,
+        });
     } catch {
         // Never crash on usage event
     }
@@ -919,6 +925,8 @@ session.on("session.shutdown", (event) => {
             ...(event.data || {}),
         };
         persistSession(currentSession.shutdownData);
+        // Unblock onSessionEnd if it is waiting for shutdown data
+        if (_resolveShutdownGate) _resolveShutdownGate();
     } catch {
         // Never crash on shutdown
     }
