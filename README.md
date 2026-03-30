@@ -51,6 +51,8 @@ The extension provides 4 tools you can invoke by asking the agent naturally:
 > "How many tokens did I use this week?"
 > "Show usage for today"
 
+When an agent invokes this tool, it should pass the output through verbatim without summarizing, truncating, or rephrasing it. It should prefer the tool's native presentation when that output will be visible to you; otherwise it should echo the same output verbatim as assistant text.
+
 Returns a table like:
 
 ```
@@ -112,6 +114,8 @@ If a model does not have an exact public pricing source, the report shows `N/A` 
 > "Show my recent sessions"
 > "List sessions from this week"
 
+When an agent invokes this tool, it should pass the output through verbatim without summarizing, truncating, or rephrasing it. It should prefer the tool's native presentation when that output will be visible to you; otherwise it should echo the same output verbatim as assistant text.
+
 ```
 ═══ Recent Sessions (3) ═══
 
@@ -128,6 +132,8 @@ If a model does not have an exact public pricing source, the report shows `N/A` 
 
 > "Export my usage to CSV"
 > "Export this month's usage to usage.csv"
+
+When `output_path` is omitted and the CSV is returned directly, an agent should pass that output through verbatim without summarizing, truncating, or rephrasing it. It should prefer the tool's native presentation when that output will be visible to you; otherwise it should echo the same output verbatim as assistant text.
 
 Exports data with columns: `date, session_id, model, requests, cost, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens`
 

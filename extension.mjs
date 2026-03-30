@@ -32,20 +32,49 @@ function saveData(data) {
     writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), "utf-8");
 }
 
-// ── In-memory tracking for current session ───────────────────────────────────
-const currentSession = {
-    trackerRecordId: randomUUID(),
-    id: null,
-    startTime: new Date().toISOString(),
-    cwd: process.cwd(),
-    calls: [],           // per-API-call records from assistant.usage
-    shutdownData: null,   // populated from session.shutdown
-    persistedState: "none", // "none" | "partial" | "final"
-};
+function createSessionState() {
+    return {
+        trackerRecordId: randomUUID(),
+        id: null,
+        startTime: new Date().toISOString(),
+        cwd: process.cwd(),
+        calls: [],           // per-API-call records from assistant.usage
+        shutdownData: null,  // populated from session.shutdown
+        persistedState: "none", // "none" | "partial" | "final"
+    };
+}
 
-// Promise-based gate so onSessionEnd can wait for session.shutdown to arrive.
-let _resolveShutdownGate = null;
-const _shutdownGate = new Promise((resolve) => { _resolveShutdownGate = resolve; });
+function createShutdownGate() {
+    let resolve = null;
+    const promise = new Promise((innerResolve) => {
+        resolve = innerResolve;
+    });
+    return { promise, resolve };
+}
+
+// ── In-memory tracking for current session ───────────────────────────────────
+const currentSession = createSessionState();
+let shutdownGate = createShutdownGate();
+
+function resetCurrentSession(overrides = {}) {
+    Object.assign(currentSession, createSessionState(), overrides);
+    shutdownGate = createShutdownGate();
+}
+
+function updateCurrentSession({ sessionId, startTime, cwd }) {
+    if (sessionId && currentSession.id && currentSession.id !== sessionId) {
+        resetCurrentSession({
+            id: sessionId,
+            startTime: startTime ?? new Date().toISOString(),
+            cwd: cwd ?? process.cwd(),
+        });
+        return;
+    }
+
+    currentSession.id = sessionId ?? currentSession.id;
+    currentSession.startTime = startTime ?? currentSession.startTime;
+    currentSession.cwd = cwd ?? currentSession.cwd;
+}
 
 function buildSessionRecord(shutdownData = currentSession.shutdownData) {
     const record = {
@@ -657,8 +686,11 @@ function formatQuotaSection(quota) {
 function handleEvent(event) {
     try {
         if (event.type === "session.start") {
-            currentSession.id = event.data.sessionId;
-            currentSession.startTime = event.data.startTime || event.timestamp;
+            updateCurrentSession({
+                sessionId: event.data.sessionId,
+                startTime: event.data.startTime || event.timestamp,
+                cwd: event.data.cwd,
+            });
         }
     } catch {
         // Never let event handling crash the extension
@@ -674,16 +706,18 @@ const session = await joinSession({
     onEvent: handleEvent,
     hooks: {
         onSessionStart: async (input) => {
-            currentSession.id = input?.sessionId ?? currentSession.id;
-            currentSession.startTime = input?.startTime ?? currentSession.startTime;
-            currentSession.cwd = input?.cwd ?? currentSession.cwd;
+            updateCurrentSession({
+                sessionId: input?.sessionId,
+                startTime: input?.startTime,
+                cwd: input?.cwd,
+            });
         },
         onSessionEnd: async (input, _invocation) => {
             // The input may carry the same authoritative metrics as session.shutdown.
             if (input && !currentSession.shutdownData) {
                 const candidate = {
-                    timestamp: input.timestamp || new Date().toISOString(),
                     ...(typeof input === "object" ? input : {}),
+                    timestamp: input.timestamp || new Date().toISOString(),
                 };
                 if (candidate.modelMetrics || candidate.totalPremiumRequests != null) {
                     currentSession.shutdownData = candidate;
@@ -696,18 +730,20 @@ const session = await joinSession({
             // calls-only record.
             if (!currentSession.shutdownData) {
                 await Promise.race([
-                    _shutdownGate,
+                    shutdownGate.promise,
                     new Promise((r) => setTimeout(r, 500)),
                 ]);
             }
 
-            persistSession();
+            if (currentSession.persistedState !== "final") {
+                persistSession();
+            }
         },
     },
     tools: [
         {
             name: "usage_report",
-            description: "Show token usage report across all Copilot CLI sessions, broken down by model. Supports filtering by time range. Use this when the user asks about their token usage, model usage, or costs. IMPORTANT: Always display the full output verbatim to the user inside a code block. Do not summarize, truncate, or rephrase the output.",
+            description: "Show token usage report across all Copilot CLI sessions, broken down by model. Supports filtering by time range. Use this when the user asks about their token usage, model usage, or costs. IMPORTANT: Display the full output verbatim without summarizing, truncating, or rephrasing it. Prefer the tool's native presentation when it will be visible to the user; otherwise echo the output verbatim as assistant text.",
             parameters: {
                 type: "object",
                 properties: {
@@ -753,7 +789,7 @@ const session = await joinSession({
         },
         {
             name: "usage_sessions",
-            description: "List individual session usage records with per-session model breakdown. Shows recent sessions first. IMPORTANT: Always display the full output verbatim to the user inside a code block. Do not summarize, truncate, or rephrase the output.",
+            description: "List individual session usage records with per-session model breakdown. Shows recent sessions first. IMPORTANT: Display the full output verbatim without summarizing, truncating, or rephrasing it. Prefer the tool's native presentation when it will be visible to the user; otherwise echo the output verbatim as assistant text.",
             parameters: {
                 type: "object",
                 properties: {
@@ -805,7 +841,7 @@ const session = await joinSession({
         },
         {
             name: "usage_export",
-            description: "Export usage data as CSV for further analysis in Excel or other tools. IMPORTANT: When returning CSV content directly (no output_path), display the full output verbatim to the user inside a code block. Do not summarize or truncate.",
+            description: "Export usage data as CSV for further analysis in Excel or other tools. IMPORTANT: When returning CSV content directly (no output_path), display the full output verbatim without summarizing, truncating, or rephrasing it. Prefer the tool's native presentation when it will be visible to the user; otherwise echo the output verbatim as assistant text.",
             parameters: {
                 type: "object",
                 properties: {
@@ -926,7 +962,7 @@ session.on("session.shutdown", (event) => {
         };
         persistSession(currentSession.shutdownData);
         // Unblock onSessionEnd if it is waiting for shutdown data
-        if (_resolveShutdownGate) _resolveShutdownGate();
+        if (shutdownGate.resolve) shutdownGate.resolve();
     } catch {
         // Never crash on shutdown
     }
